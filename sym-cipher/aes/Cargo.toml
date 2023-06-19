@@ -1,5 +1,5 @@
 [package]
-name = "poseidon"
+name = "aes"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
@@ -13,8 +13,6 @@ log = "0.4"
 num-bigint = { version = "0.4" }
 halo2-base = { path = "../../halo2-base", default-features = false, features = ["halo2-axiom"] }
 rayon = "1.6.1"
-poseidon = { path = "../../../halo2/primitives/poseidon" }
-# poseidon = { git = "https://github.com/axiom-crypto/halo2.git", branch = "axiom/dev", package = "poseidon" }
 
 [dev-dependencies]
 hex = "0.4.3"

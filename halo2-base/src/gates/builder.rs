@@ -1,6 +1,7 @@
 use super::{
     flex_gate::{FlexGateConfig, GateStrategy, MAX_PHASE},
     range::{RangeConfig, RangeStrategy},
+    sbox::{SBOXConfig, SBOXStrategy}
 };
 use crate::{
     halo2_proofs::{
@@ -763,6 +764,201 @@ impl<F: ScalarField> Circuit<F> for RangeWithInstanceCircuitBuilder<F> {
             &range.gate,
             &range.lookup_advice,
             &range.q_lookup,
+            &mut layouter,
+        );
+
+        if !witness_gen_only {
+            // expose public instances
+            let mut layouter = layouter.namespace(|| "expose");
+            for (i, instance) in self.assigned_instances.iter().enumerate() {
+                let cell = instance.cell.unwrap();
+                let (cell, _) = assigned_advices
+                    .get(&(cell.context_id, cell.offset))
+                    .expect("instance not assigned");
+                layouter.constrain_instance(*cell, config.instance, i);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A wrapper struct to auto-build a circuit from a `GateThreadBuilder`.
+#[derive(Clone, Debug)]
+pub struct SBOXCircuitBuilder<F: ScalarField>(pub GateCircuitBuilder<F>);
+
+impl<F: ScalarField> SBOXCircuitBuilder<F> {
+    /// Creates an instance of the [SBOXCircuitBuilder] and executes in keygen mode.
+    pub fn keygen(builder: GateThreadBuilder<F>) -> Self {
+        Self(GateCircuitBuilder::keygen(builder))
+    }
+
+    /// Creates a mock instance of the [SBOXCircuitBuilder].
+    pub fn mock(builder: GateThreadBuilder<F>) -> Self {
+        Self(GateCircuitBuilder::mock(builder))
+    }
+
+    /// Creates an instance of the [SBOXCircuitBuilder] and executes in prover mode.
+    pub fn prover(
+        builder: GateThreadBuilder<F>,
+        break_points: MultiPhaseThreadBreakPoints,
+    ) -> Self {
+        Self(GateCircuitBuilder::prover(builder, break_points))
+    }
+}
+
+impl<F: ScalarField> Circuit<F> for SBOXCircuitBuilder<F> {
+    type Config = SBOXConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    /// Creates a new instance of the [SBOXCircuitBuilder] without witnesses by setting the witness_gen_only flag to false
+    fn without_witnesses(&self) -> Self {
+        unimplemented!()
+    }
+
+    /// Configures a new circuit using the the parameters specified [Config] and environment variable `LOOKUP_BITS`.
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let FlexGateConfigParams {
+            strategy,
+            num_advice_per_phase,
+            num_lookup_advice_per_phase,
+            num_fixed,
+            k,
+        } = serde_json::from_str(&var("FLEX_GATE_CONFIG_PARAMS").unwrap()).unwrap();
+        let strategy = match strategy {
+            GateStrategy::Vertical => SBOXStrategy::Vertical,
+        };
+        SBOXConfig::configure(
+            meta,
+            strategy,
+            &num_advice_per_phase,
+            &num_lookup_advice_per_phase,
+            num_fixed,
+            k,
+        )
+    }
+
+    /// Performs the actual computation on the circuit (e.g., witness generation), populating the lookup table and filling in all the advice values for a particular proof.
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        // only load lookup table if we are actually doing lookups
+        if config.lookup_advice.iter().map(|a| a.len()).sum::<usize>() != 0
+            || !config.q_lookup.iter().all(|q| q.is_none())
+        {
+            config.load_lookup_table(&mut layouter).expect("load lookup table should not fail");
+        }
+        self.0.sub_synthesize(&config.gate, &config.lookup_advice, &config.q_lookup, &mut layouter);
+        Ok(())
+    }
+}
+
+/// Configuration with [`SBOXConfig`] and a single public instance column.
+#[derive(Clone, Debug)]
+pub struct SBOXWithInstanceConfig<F: ScalarField> {
+    /// The underlying SBOX configuration
+    pub sbox: SBOXConfig<F>,
+    /// The public instance column
+    pub instance: Column<Instance>,
+}
+
+/// This is an extension of [`SBOXCircuitBuilder`] that adds support for public instances (aka public inputs+outputs)
+///
+/// The intended design is that a [`GateThreadBuilder`] is populated and then produces some assigned instances, which are supplied as `assigned_instances` to this struct.
+/// The [`Circuit`] implementation for this struct will then expose these instances and constrain them using the Halo2 API.
+#[derive(Clone, Debug)]
+pub struct SBOXWithInstanceCircuitBuilder<F: ScalarField> {
+    /// The underlying circuit builder
+    pub circuit: SBOXCircuitBuilder<F>,
+    /// The assigned instances to expose publicly at the end of circuit synthesis
+    pub assigned_instances: Vec<AssignedValue<F>>,
+}
+
+impl<F: ScalarField> SBOXWithInstanceCircuitBuilder<F> {
+    /// See [`SBOXCircuitBuilder::keygen`]
+    pub fn keygen(
+        builder: GateThreadBuilder<F>,
+        assigned_instances: Vec<AssignedValue<F>>,
+    ) -> Self {
+        Self { circuit: SBOXCircuitBuilder::keygen(builder), assigned_instances }
+    }
+
+    /// See [`SBOXCircuitBuilder::mock`]
+    pub fn mock(builder: GateThreadBuilder<F>, assigned_instances: Vec<AssignedValue<F>>) -> Self {
+        Self { circuit: SBOXCircuitBuilder::mock(builder), assigned_instances }
+    }
+
+    /// See [`SBOXCircuitBuilder::prover`]
+    pub fn prover(
+        builder: GateThreadBuilder<F>,
+        assigned_instances: Vec<AssignedValue<F>>,
+        break_points: MultiPhaseThreadBreakPoints,
+    ) -> Self {
+        Self { circuit: SBOXCircuitBuilder::prover(builder, break_points), assigned_instances }
+    }
+
+    /// Creates a new instance of the [SBOXWithInstanceCircuitBuilder].
+    pub fn new(circuit: SBOXCircuitBuilder<F>, assigned_instances: Vec<AssignedValue<F>>) -> Self {
+        Self { circuit, assigned_instances }
+    }
+
+    /// Calls [`GateThreadBuilder::config`]
+    pub fn config(&self, k: u32, minimum_rows: Option<usize>) -> FlexGateConfigParams {
+        self.circuit.0.builder.borrow().config(k as usize, minimum_rows)
+    }
+
+    /// Gets the break points of the circuit.
+    pub fn break_points(&self) -> MultiPhaseThreadBreakPoints {
+        self.circuit.0.break_points.borrow().clone()
+    }
+
+    /// Gets the number of instances.
+    pub fn instance_count(&self) -> usize {
+        self.assigned_instances.len()
+    }
+
+    /// Gets the instances.
+    pub fn instance(&self) -> Vec<F> {
+        self.assigned_instances.iter().map(|v| *v.value()).collect()
+    }
+}
+
+impl<F: ScalarField> Circuit<F> for SBOXWithInstanceCircuitBuilder<F> {
+    type Config = SBOXWithInstanceConfig<F>;
+    type FloorPlanner = SimpleFloorPlanner;
+
+    fn without_witnesses(&self) -> Self {
+        unimplemented!()
+    }
+
+    fn configure(meta: &mut ConstraintSystem<F>) -> Self::Config {
+        let sbox = SBOXCircuitBuilder::configure(meta);
+        let instance = meta.instance_column();
+        meta.enable_equality(instance);
+        SBOXWithInstanceConfig { sbox, instance }
+    }
+
+    fn synthesize(
+        &self,
+        config: Self::Config,
+        mut layouter: impl Layouter<F>,
+    ) -> Result<(), Error> {
+        // copied from SBOXCircuitBuilder::synthesize but with extra logic to expose public instances
+        let sbox = config.sbox;
+        let circuit = &self.circuit.0;
+        // only load lookup table if we are actually doing lookups
+        if sbox.lookup_advice.iter().map(|a| a.len()).sum::<usize>() != 0
+            || !sbox.q_lookup.iter().all(|q| q.is_none())
+        {
+            sbox.load_lookup_table(&mut layouter).expect("load lookup table should not fail");
+        }
+        // we later `take` the builder, so we need to save this value
+        let witness_gen_only = circuit.builder.borrow().witness_gen_only();
+        let assigned_advices = circuit.sub_synthesize(
+            &sbox.gate,
+            &sbox.lookup_advice,
+            &sbox.q_lookup,
             &mut layouter,
         );
 
